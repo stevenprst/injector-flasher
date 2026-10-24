@@ -1,0 +1,11 @@
+# CubeIDE build output
+Debug/
+Release/
+
+# Backups and Python caches
+*.bak
+__pycache__/
+*.pyc
+
+# The notes, the plan and the reference copy of the code in docs are not part of this repository
+docs/
