@@ -114,19 +114,105 @@ static_assert(sectorNumberStartingAt(image_address + 768 * page_size_bytes) == F
 
 } // namespace flash_layout
 
+// ---- USB link to the PC (a virtual COM port) ----
+
+// A request is: magic, command, length (u16), payload. A response is: magic, command, code, length, payload. Both fit
+// in one 64 byte USB packet. The PC sends one request and waits for its response.
+static constexpr uint8_t link_version = 1;
+static constexpr uint8_t request_magic = 0xA5;
+static constexpr uint8_t response_magic = 0x5A;
+static constexpr uint32_t request_header_bytes = 4;
+static constexpr uint32_t response_header_bytes = 4;
+static constexpr uint32_t max_payload_bytes = 60;
+static constexpr uint32_t chunk_offset_bytes = 4;
+static constexpr uint32_t max_chunk_data_bytes = max_payload_bytes - chunk_offset_bytes;	// 56, a multiple of 4
+static_assert(max_chunk_data_bytes % 4 == 0, "a chunk carries whole flash words");
+static_assert(request_header_bytes + max_payload_bytes <= 64, "a request fits in one USB packet");
+static_assert(response_header_bytes + max_payload_bytes <= 64, "a response fits in one USB packet");
+
+// A request that stops half way is dropped after this long, so the next request starts clean.
+static constexpr uint32_t request_timeout_ms = 200;
+
+// Bytes from the USB interrupt to the main loop. A power of two.
+static constexpr uint32_t usb_ring_size = 512;
+static_assert((usb_ring_size & (usb_ring_size - 1)) == 0, "the ring index is taken with a modulo of a power of two");
+
+enum class LinkCommand : uint8_t {
+	GetStatus = 1,		// what the injector holds and how an injection is going
+};
+
+enum class LinkCode : uint8_t {
+	Ok = 0,
+	BadCommand = 1,
+	BadLength = 2,		// the payload has the wrong size
+};
+
+struct __attribute__((packed)) StatusPayload {
+	uint8_t link_version;
+	uint8_t receiving;		// 1 between BeginImage and EndImage
+	uint8_t has_image;
+	uint8_t target_node_id;
+	uint16_t page_count;
+	uint16_t pages_done;		// pages the bootloader has acknowledged in this injection
+	uint8_t inject_state;
+	uint8_t inject_error;
+	uint8_t target_error_code;	// the code of the bootloader when inject_error is TargetRefused
+	uint32_t image_size_bytes;
+	uint32_t image_crc;
+};
+
+static_assert(sizeof(StatusPayload) == 19, "GetStatus carries 19 bytes");
+
 class InjectorFlasher
 {
 public:
 	// Look for a stored image.
 	void init();
 
-	// One pass of the main loop.
+	// One pass of the main loop: the PC link.
 	void run();
 
+	// Called from the USB interrupt for every packet from the PC.
+	void onUsbReceive(const uint8_t *data, uint32_t length);
+
 private:
+	enum class ParserState : uint8_t {
+		WaitingForMagic,
+		ReadingHeader,
+		ReadingPayload,
+	};
+
+	// PC link
+	void _serviceUsb();
+	void _parseByte(uint8_t byte);
+	void _handleRequest();
+	void _handleGetStatus();
+	void _reply(LinkCode code, const void *payload, uint32_t payload_bytes);
+	void _sendPendingReply();
+
 	// The stored image
 	void _loadHeader();
 	bool _deleteStoredImage();
+
+	// Bytes from the USB interrupt. The interrupt only writes _rx_head, the main loop only _rx_tail.
+	std::atomic<uint32_t> _rx_head{0};
+	std::atomic<uint32_t> _rx_tail{0};
+	uint8_t _rx_ring[usb_ring_size]{};
+
+	// The request being read
+	ParserState _parser_state{ParserState::WaitingForMagic};
+	uint8_t _header_bytes[3]{};	// command, length low, length high
+	uint32_t _header_received{0};
+	LinkCommand _request_command{LinkCommand::GetStatus};
+	uint32_t _request_length{0};
+	uint8_t _request_payload[max_payload_bytes]{};
+	uint32_t _payload_received{0};
+	uint32_t _last_byte_ms{0};
+
+	// The response waiting to leave. The next request is not read before it has gone.
+	uint8_t _reply_buffer[response_header_bytes + max_payload_bytes]{};
+	uint32_t _reply_length{0};
+	bool _reply_pending{false};
 
 	// The stored image: valid when a header with the right CRC is in flash
 	bool _has_image{false};
