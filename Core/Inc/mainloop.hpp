@@ -139,12 +139,42 @@ static_assert((usb_ring_size & (usb_ring_size - 1)) == 0, "the ring index is tak
 
 enum class LinkCommand : uint8_t {
 	GetStatus = 1,		// what the injector holds and how an injection is going
+	BeginImage = 2,		// start a new image: invalidates the stored one
+	WriteChunk = 3,		// the next bytes of the image
+	EndImage = 4,		// check the image CRC and store the header
 };
 
 enum class LinkCode : uint8_t {
 	Ok = 0,
 	BadCommand = 1,
 	BadLength = 2,		// the payload has the wrong size
+	BadOffset = 3,		// a chunk that is not the next one
+	FlashFailed = 4,	// an erase or a program failed
+	CrcMismatch = 5,	// the received image does not match the CRC of BeginImage
+	Busy = 6,		// an injection is running
+	NoImage = 7,
+	BadState = 8,		// WriteChunk or EndImage without BeginImage, or the image is incomplete
+	BadImage = 9,		// the sizes of BeginImage do not agree or are too big
+};
+
+struct __attribute__((packed)) BeginImagePayload {
+	uint32_t image_size_bytes;
+	uint32_t image_crc;
+	uint16_t page_count;
+	uint8_t target_node_id;
+};
+
+static_assert(sizeof(BeginImagePayload) == 11, "BeginImage carries 11 bytes");
+
+enum class InjectState : uint8_t {
+	Idle = 0,
+	Connecting = 1,		// trigger frame, then pings until the bootloader answers
+	SendingWords = 2,	// the 256 words of a page, one command each
+	WritingPage = 3,	// WritePage and its answer
+	WritingCrc = 4,		// WriteCrc and its answer
+	StartingApp = 5,
+	Done = 6,
+	Failed = 7,
 };
 
 struct __attribute__((packed)) StatusPayload {
@@ -187,12 +217,17 @@ private:
 	void _parseByte(uint8_t byte);
 	void _handleRequest();
 	void _handleGetStatus();
+	void _handleBeginImage();
+	void _handleWriteChunk();
+	void _handleEndImage();
 	void _reply(LinkCode code, const void *payload, uint32_t payload_bytes);
 	void _sendPendingReply();
 
 	// The stored image
 	void _loadHeader();
 	bool _deleteStoredImage();
+	bool _appendWord(uint32_t word);
+	bool _isInjecting() const;
 
 	// Bytes from the USB interrupt. The interrupt only writes _rx_head, the main loop only _rx_tail.
 	std::atomic<uint32_t> _rx_head{0};
@@ -220,6 +255,16 @@ private:
 
 	// True between BeginImage and EndImage, while the image in the flash is not yet complete
 	bool _receiving{false};
+
+	// The image being received
+	BeginImagePayload _incoming{};
+	uint32_t _expected_offset{0};
+	uint32_t _page_buffer_words[page_size_words]{};
+	uint32_t _words_in_page{0};
+	uint32_t _pages_written{0};
+
+	// The injection
+	InjectState _inject_state{InjectState::Idle};
 
 };
 
