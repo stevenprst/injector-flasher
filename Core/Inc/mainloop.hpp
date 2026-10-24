@@ -142,6 +142,7 @@ enum class LinkCommand : uint8_t {
 	BeginImage = 2,		// start a new image: invalidates the stored one
 	WriteChunk = 3,		// the next bytes of the image
 	EndImage = 4,		// check the image CRC and store the header
+	DeleteImage = 5,	// invalidate the stored image
 };
 
 enum class LinkCode : uint8_t {
@@ -220,6 +221,7 @@ private:
 	void _handleBeginImage();
 	void _handleWriteChunk();
 	void _handleEndImage();
+	void _handleDeleteImage();
 	void _reply(LinkCode code, const void *payload, uint32_t payload_bytes);
 	void _sendPendingReply();
 

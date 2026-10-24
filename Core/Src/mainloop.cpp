@@ -267,6 +267,10 @@ void InjectorFlasher::_handleRequest()
 		_handleEndImage();
 		break;
 
+	case LinkCommand::DeleteImage:
+		_handleDeleteImage();
+		break;
+
 	default:
 		_reply(LinkCode::BadCommand, nullptr, 0);
 		break;
@@ -421,6 +425,21 @@ void InjectorFlasher::_handleEndImage()
 
 	_header = header;
 	_has_image = true;
+	_reply(LinkCode::Ok, nullptr, 0);
+}
+
+void InjectorFlasher::_handleDeleteImage()
+{
+	if (_isInjecting()) {
+		_reply(LinkCode::Busy, nullptr, 0);
+		return;
+	}
+
+	if (!_deleteStoredImage()) {
+		_reply(LinkCode::FlashFailed, nullptr, 0);
+		return;
+	}
+
 	_reply(LinkCode::Ok, nullptr, 0);
 }
 
