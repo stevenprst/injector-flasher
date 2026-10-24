@@ -271,7 +271,7 @@ public:
 	// Look for a stored image, set up the CAN filter and start CAN.
 	void init();
 
-	// One pass of the main loop: the PC link and the front panel.
+	// One pass of the main loop: the PC link, the injection, the front panel.
 	void run();
 
 	// Called from the USB interrupt for every packet from the PC.
@@ -303,11 +303,16 @@ private:
 	bool _isInjecting() const;
 
 	// The injection into the target
+	void _startInjection();
+	void _serviceInjection();
 	void _readCanReplies();
 	bool _mailboxAvailable();
 	bool _sendBootCommand(BootCommand command, uint16_t index, uint32_t value);
 	bool _sendTrigger();
 	void _failInjection(InjectError error, uint8_t target_error_code);
+	enum class Progress : uint8_t { InProgress, Succeeded, Failed };
+	Progress _runCommand(BootCommand command, uint16_t index, uint32_t value, uint32_t timeout_ms);
+	void _stepConnecting();
 
 	// The front panel
 	void _servicePanel();
@@ -352,8 +357,14 @@ private:
 	InjectState _inject_state{InjectState::Idle};
 	InjectError _inject_error{InjectError::None};
 	uint8_t _target_error_code{0};
+	uint32_t _inject_page{0};
+	uint32_t _inject_word{0};
+	uint32_t _page_crc{0};
 	bool _can_ready{false};
+	bool _trigger_sent{false};
+	uint32_t _ping_count{0};
 	bool _command_in_flight{false};
+	uint32_t _retries{0};
 	uint32_t _command_sent_ms{0};
 	uint32_t _send_attempt_started_ms{0};
 	bool _send_attempt_open{false};
@@ -363,6 +374,7 @@ private:
 	BootResponseFrame _boot_reply{};
 
 	// The front panel
+	Button _inject_button{};
 	Button _delete_button{};
 };
 

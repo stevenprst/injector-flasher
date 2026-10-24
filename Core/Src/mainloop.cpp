@@ -157,6 +157,8 @@ void InjectorFlasher::init()
 	_loadHeader();
 
 	// A button that is held while the board starts counts only after it has been released.
+	_inject_button.pressed = isPressed(BUTTON_INJECT_GPIO_Port, BUTTON_INJECT_Pin);
+	_inject_button.action_done = _inject_button.pressed;
 	_delete_button.pressed = isPressed(BUTTON_DELETE_GPIO_Port, BUTTON_DELETE_Pin);
 	_delete_button.action_done = _delete_button.pressed;
 }
@@ -164,6 +166,7 @@ void InjectorFlasher::init()
 void InjectorFlasher::run()
 {
 	_serviceUsb();
+	_serviceInjection();
 	_servicePanel();
 }
 
@@ -314,6 +317,7 @@ void InjectorFlasher::_handleGetStatus()
 	status.has_image = _has_image ? 1 : 0;
 	status.target_node_id = static_cast<uint8_t>(_has_image ? _header.target_node_id : 0);
 	status.page_count = static_cast<uint16_t>(_has_image ? _header.page_count : 0);
+	status.pages_done = static_cast<uint16_t>(_inject_page);
 	status.inject_state = static_cast<uint8_t>(_inject_state);
 	status.inject_error = static_cast<uint8_t>(_inject_error);
 	status.target_error_code = _target_error_code;
@@ -356,6 +360,7 @@ void InjectorFlasher::_handleBeginImage()
 	_inject_state = InjectState::Idle;
 	_inject_error = InjectError::None;
 	_target_error_code = 0;
+	_inject_page = 0;
 
 	if (!eraseSectorStartingAt(header_sector_address)) {
 		_receiving = false;
@@ -539,6 +544,7 @@ bool InjectorFlasher::_deleteStoredImage()
 	_inject_state = InjectState::Idle;
 	_inject_error = InjectError::None;
 	_target_error_code = 0;
+	_inject_page = 0;
 
 	return eraseSectorStartingAt(header_sector_address);
 }
@@ -592,6 +598,112 @@ bool InjectorFlasher::_isInjecting() const
 }
 
 // ---- the injection into the target ----
+
+void InjectorFlasher::_startInjection()
+{
+	const bool can_start = _has_image && !_receiving && !_isInjecting();
+
+	if (!can_start) {
+		return;
+	}
+
+	_inject_error = InjectError::None;
+	_target_error_code = 0;
+	_inject_page = 0;
+	_inject_word = 0;
+	_trigger_sent = false;
+	_ping_count = 0;
+	_command_in_flight = false;
+	_send_attempt_open = false;
+
+	if (!_can_ready) {
+		_failInjection(InjectError::CanNotStarted, 0);
+		return;
+	}
+
+	_inject_state = InjectState::Connecting;
+}
+
+void InjectorFlasher::_serviceInjection()
+{
+	// Drain the CAN FIFO on every pass, so a late reply never waits in it.
+	_readCanReplies();
+
+	switch (_inject_state) {
+	case InjectState::Connecting:
+		_stepConnecting();
+		break;
+
+	case InjectState::SendingWords: {
+			const uint32_t word = imageWords()[_inject_page * page_size_words + _inject_word];
+			const Progress progress = _runCommand(BootCommand::WriteBuffer, static_cast<uint16_t>(_inject_word), word,
+							      reply_timeout_ms);
+
+			if (progress != Progress::Succeeded) {
+				break;
+			}
+
+			_inject_word++;
+
+			const bool page_complete = _inject_word == page_size_words;
+
+			if (page_complete) {
+				_page_crc = calculateWordsCrc(&imageWords()[_inject_page * page_size_words], page_size_words);
+				_inject_word = 0;
+				_inject_state = InjectState::WritingPage;
+			}
+
+			break;
+		}
+
+	case InjectState::WritingPage: {
+			const Progress progress = _runCommand(BootCommand::WritePage, static_cast<uint16_t>(_inject_page), _page_crc,
+							      write_page_timeout_ms);
+
+			if (progress != Progress::Succeeded) {
+				break;
+			}
+
+			_inject_page++;
+
+			const bool last_page_done = _inject_page == _header.page_count;
+
+			if (last_page_done) {
+				_inject_state = InjectState::WritingCrc;
+			} else {
+				_inject_state = InjectState::SendingWords;
+			}
+
+			break;
+		}
+
+	case InjectState::WritingCrc: {
+			const Progress progress = _runCommand(BootCommand::WriteCrc, static_cast<uint16_t>(_header.page_count),
+							      _header.image_crc, write_crc_timeout_ms);
+
+			if (progress == Progress::Succeeded) {
+				_inject_state = InjectState::StartingApp;
+			}
+
+			break;
+		}
+
+	case InjectState::StartingApp: {
+			const Progress progress = _runCommand(BootCommand::StartApp, 0, 0, start_app_timeout_ms);
+
+			if (progress == Progress::Succeeded) {
+				_inject_state = InjectState::Done;
+			}
+
+			break;
+		}
+
+	case InjectState::Idle:
+	case InjectState::Done:
+	case InjectState::Failed:
+		break;
+	}
+}
 
 void InjectorFlasher::_readCanReplies()
 {
@@ -712,13 +824,103 @@ void InjectorFlasher::_failInjection(InjectError error, uint8_t target_error_cod
 	_inject_state = InjectState::Failed;
 }
 
+InjectorFlasher::Progress InjectorFlasher::_runCommand(BootCommand command, uint16_t index, uint32_t value,
+		uint32_t timeout_ms)
+{
+	if (!_command_in_flight) {
+		if (_sendBootCommand(command, index, value)) {
+			_command_in_flight = true;
+			_retries = 0;
+		}
+
+		return Progress::InProgress;
+	}
+
+	if (_reply_valid) {
+		_command_in_flight = false;
+
+		const bool accepted = _boot_reply.code == 0;
+
+		if (accepted) {
+			return Progress::Succeeded;
+		}
+
+		_failInjection(InjectError::TargetRefused, _boot_reply.code);
+		return Progress::Failed;
+	}
+
+	const bool timed_out = (HAL_GetTick() - _command_sent_ms) >= timeout_ms;
+
+	if (!timed_out) {
+		return Progress::InProgress;
+	}
+
+	if (_retries >= command_retries) {
+		_failInjection(InjectError::NoReply, 0);
+		return Progress::Failed;
+	}
+
+	// A word or a page sent twice is harmless, so a lost reply is asked for again.
+	if (_sendBootCommand(command, index, value)) {
+		_retries++;
+	}
+
+	return Progress::InProgress;
+}
+
+void InjectorFlasher::_stepConnecting()
+{
+	// First the trigger, which resets a running app into its bootloader.
+	if (!_trigger_sent) {
+		_trigger_sent = _sendTrigger();
+		return;
+	}
+
+	if (!_command_in_flight) {
+		if (_ping_count >= ping_tries) {
+			_failInjection(InjectError::CannotConnect, 0);
+			return;
+		}
+
+		if (_sendBootCommand(BootCommand::Ping, 0, 0)) {
+			_command_in_flight = true;
+			_ping_count++;
+		}
+
+		return;
+	}
+
+	if (_reply_valid) {
+		_command_in_flight = false;
+		_inject_page = 0;
+		_inject_word = 0;
+		_inject_state = InjectState::SendingWords;
+		return;
+	}
+
+	const bool ping_timed_out = (HAL_GetTick() - _command_sent_ms) >= ping_timeout_ms;
+
+	if (ping_timed_out) {
+		_command_in_flight = false;
+	}
+}
+
 // ---- the front panel ----
 
 void InjectorFlasher::_servicePanel()
 {
 	const uint32_t now_ms = HAL_GetTick();
 
+	_updateButton(_inject_button, BUTTON_INJECT_GPIO_Port, BUTTON_INJECT_Pin, now_ms);
 	_updateButton(_delete_button, BUTTON_DELETE_GPIO_Port, BUTTON_DELETE_Pin, now_ms);
+
+	const bool inject_pressed_long_enough = _inject_button.pressed && !_inject_button.action_done
+						&& (now_ms - _inject_button.pressed_since_ms) >= button_debounce_ms;
+
+	if (inject_pressed_long_enough) {
+		_inject_button.action_done = true;
+		_startInjection();
+	}
 
 	const bool delete_held_long_enough = _delete_button.pressed && !_delete_button.action_done
 					     && (now_ms - _delete_button.pressed_since_ms) >= delete_hold_ms;
