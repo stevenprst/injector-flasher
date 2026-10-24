@@ -118,6 +118,11 @@ uint32_t calculateWordsCrc(const uint32_t *words, uint32_t word_count)
 	return HAL_CRC_Calculate(&hcrc, const_cast<uint32_t *>(words), word_count);
 }
 
+bool isPressed(GPIO_TypeDef *port, uint16_t pin)
+{
+	return HAL_GPIO_ReadPin(port, pin) == button_pressed_level;
+}
+
 uint32_t readU32(const uint8_t *bytes)
 {
 	uint32_t value;
@@ -131,11 +136,16 @@ uint32_t readU32(const uint8_t *bytes)
 void InjectorFlasher::init()
 {
 	_loadHeader();
+
+	// A button that is held while the board starts counts only after it has been released.
+	_delete_button.pressed = isPressed(BUTTON_DELETE_GPIO_Port, BUTTON_DELETE_Pin);
+	_delete_button.action_done = _delete_button.pressed;
 }
 
 void InjectorFlasher::run()
 {
 	_serviceUsb();
+	_servicePanel();
 }
 
 void InjectorFlasher::onUsbReceive(const uint8_t *data, uint32_t length)
@@ -554,6 +564,53 @@ bool InjectorFlasher::_isInjecting() const
 	}
 
 	return false;
+}
+
+// ---- the front panel ----
+
+void InjectorFlasher::_servicePanel()
+{
+	const uint32_t now_ms = HAL_GetTick();
+
+	_updateButton(_delete_button, BUTTON_DELETE_GPIO_Port, BUTTON_DELETE_Pin, now_ms);
+
+	const bool delete_held_long_enough = _delete_button.pressed && !_delete_button.action_done
+					     && (now_ms - _delete_button.pressed_since_ms) >= delete_hold_ms;
+
+	if (delete_held_long_enough) {
+		_delete_button.action_done = true;
+
+		// The stored image is neither deleted under an injection nor under a transfer from the PC.
+		if (!_isInjecting() && !_receiving) {
+			_deleteStoredImage();
+		}
+	}
+
+	_updateLed(now_ms);
+}
+
+void InjectorFlasher::_updateButton(Button &button, GPIO_TypeDef *port, uint16_t pin, uint32_t now_ms)
+{
+	const bool pressed_now = isPressed(port, pin);
+
+	if (pressed_now && !button.pressed) {
+		button.pressed_since_ms = now_ms;
+	}
+
+	if (!pressed_now) {
+		button.action_done = false;
+	}
+
+	button.pressed = pressed_now;
+}
+
+void InjectorFlasher::_updateLed(uint32_t now_ms)
+{
+	// Off without an image, on with one, blinking while an injection runs.
+	const bool blink_phase_on = ((now_ms / led_blink_half_period_ms) % 2) == 0;
+	const bool lit = _isInjecting() ? blink_phase_on : _has_image;
+
+	HAL_GPIO_WritePin(LED_STATUS_GPIO_Port, LED_STATUS_Pin, lit ? led_on_level : led_off_level);
 }
 
 } // namespace injector

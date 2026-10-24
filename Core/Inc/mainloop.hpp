@@ -20,6 +20,18 @@ extern CRC_HandleTypeDef hcrc;
 namespace injector
 {
 
+// ---- front panel ----
+
+// The pins come from the CubeMX labels LED_STATUS, BUTTON_INJECT and BUTTON_DELETE, so moving a pin needs no change here.
+static constexpr GPIO_PinState led_on_level = GPIO_PIN_SET;
+static constexpr GPIO_PinState led_off_level = GPIO_PIN_RESET;
+static_assert(led_on_level != led_off_level, "the LED has two levels");
+static constexpr GPIO_PinState button_pressed_level = GPIO_PIN_RESET;	// the buttons pull the pin to ground
+
+static constexpr uint32_t button_debounce_ms = 50;	// a press counts after it has read pressed for this long
+static constexpr uint32_t delete_hold_ms = 1000;	// the delete button has to be held, so a brush does not erase
+static constexpr uint32_t led_blink_half_period_ms = 100;	// the LED blinks 5 times a second while injecting
+
 // ---- flash layout ----
 
 // Sectors 0 to 3 hold this firmware (the linker script limits it to 64 KB), sector 4 the header of the stored image,
@@ -194,13 +206,20 @@ struct __attribute__((packed)) StatusPayload {
 
 static_assert(sizeof(StatusPayload) == 19, "GetStatus carries 19 bytes");
 
+// A button and what the main loop knows of it.
+struct Button {
+	bool pressed{false};		// the pin reads pressed
+	uint32_t pressed_since_ms{0};	// since when it has read pressed
+	bool action_done{false};	// the action of this press has run, so wait for the release
+};
+
 class InjectorFlasher
 {
 public:
 	// Look for a stored image.
 	void init();
 
-	// One pass of the main loop: the PC link.
+	// One pass of the main loop: the PC link and the front panel.
 	void run();
 
 	// Called from the USB interrupt for every packet from the PC.
@@ -230,6 +249,11 @@ private:
 	bool _deleteStoredImage();
 	bool _appendWord(uint32_t word);
 	bool _isInjecting() const;
+
+	// The front panel
+	void _servicePanel();
+	void _updateButton(Button &button, GPIO_TypeDef *port, uint16_t pin, uint32_t now_ms);
+	void _updateLed(uint32_t now_ms);
 
 	// Bytes from the USB interrupt. The interrupt only writes _rx_head, the main loop only _rx_tail.
 	std::atomic<uint32_t> _rx_head{0};
@@ -268,6 +292,8 @@ private:
 	// The injection
 	InjectState _inject_state{InjectState::Idle};
 
+	// The front panel
+	Button _delete_button{};
 };
 
 } // namespace injector
