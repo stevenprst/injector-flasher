@@ -135,6 +135,25 @@ uint32_t readU32(const uint8_t *bytes)
 
 void InjectorFlasher::init()
 {
+	// Pass only the answers of the bootloaders: standard ID boot_response_can_id, data frame. The mask bits are the ID,
+	// IDE and RTR bits. All filter banks belong to CAN1 because CAN2 is not used.
+	CAN_FilterTypeDef filter{};
+	filter.FilterIdHigh = boot_response_can_id << 5;
+	filter.FilterIdLow = 0x0000;
+	filter.FilterMaskIdHigh = 0x7FF << 5;
+	filter.FilterMaskIdLow = CAN_ID_EXT | CAN_RTR_REMOTE;
+	filter.FilterFIFOAssignment = CAN_FILTER_FIFO0;
+	filter.FilterBank = 0;
+	filter.FilterMode = CAN_FILTERMODE_IDMASK;
+	filter.FilterScale = CAN_FILTERSCALE_32BIT;
+	filter.FilterActivation = CAN_FILTER_ENABLE;
+	filter.SlaveStartFilterBank = 14;
+
+	const bool filter_set = HAL_CAN_ConfigFilter(&hcan1, &filter) == HAL_OK;
+
+	// The replies are read by polling in the main loop, so no CAN interrupt is enabled.
+	_can_ready = filter_set && HAL_CAN_Start(&hcan1) == HAL_OK;
+
 	_loadHeader();
 
 	// A button that is held while the board starts counts only after it has been released.
@@ -296,6 +315,8 @@ void InjectorFlasher::_handleGetStatus()
 	status.target_node_id = static_cast<uint8_t>(_has_image ? _header.target_node_id : 0);
 	status.page_count = static_cast<uint16_t>(_has_image ? _header.page_count : 0);
 	status.inject_state = static_cast<uint8_t>(_inject_state);
+	status.inject_error = static_cast<uint8_t>(_inject_error);
+	status.target_error_code = _target_error_code;
 	status.image_size_bytes = _has_image ? _header.image_size_bytes : 0;
 	status.image_crc = _has_image ? _header.image_crc : 0;
 
@@ -333,6 +354,8 @@ void InjectorFlasher::_handleBeginImage()
 	// The stored image is given up here: without a header there is no image, whatever happens next.
 	_has_image = false;
 	_inject_state = InjectState::Idle;
+	_inject_error = InjectError::None;
+	_target_error_code = 0;
 
 	if (!eraseSectorStartingAt(header_sector_address)) {
 		_receiving = false;
@@ -514,6 +537,8 @@ bool InjectorFlasher::_deleteStoredImage()
 	_has_image = false;
 	_receiving = false;
 	_inject_state = InjectState::Idle;
+	_inject_error = InjectError::None;
+	_target_error_code = 0;
 
 	return eraseSectorStartingAt(header_sector_address);
 }
@@ -564,6 +589,127 @@ bool InjectorFlasher::_isInjecting() const
 	}
 
 	return false;
+}
+
+// ---- the injection into the target ----
+
+void InjectorFlasher::_readCanReplies()
+{
+	while (HAL_CAN_GetRxFifoFillLevel(&hcan1, CAN_RX_FIFO0) > 0) {
+		CAN_RxHeaderTypeDef header;
+		uint8_t data[8];
+
+		if (HAL_CAN_GetRxMessage(&hcan1, CAN_RX_FIFO0, &header, data) != HAL_OK) {
+			return;
+		}
+
+		const bool is_reply = header.IDE == CAN_ID_STD && header.RTR == CAN_RTR_DATA
+				      && header.StdId == boot_response_can_id && header.DLC == sizeof(BootResponseFrame);
+
+		if (!is_reply) {
+			continue;
+		}
+
+		BootResponseFrame response;
+		memcpy(&response, data, sizeof(response));
+
+		const bool from_target = response.node_id == _header.target_node_id;
+		const bool answers_command = response.command == static_cast<uint8_t>(_awaiting_command)
+					     && response.index == _awaiting_index;
+
+		if (_command_in_flight && from_target && answers_command) {
+			_boot_reply = response;
+			_reply_valid = true;
+		}
+	}
+}
+
+bool InjectorFlasher::_mailboxAvailable()
+{
+	const bool mailbox_free = HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0;
+	const uint32_t now_ms = HAL_GetTick();
+
+	if (mailbox_free) {
+		_send_attempt_open = false;
+		return true;
+	}
+
+	if (!_send_attempt_open) {
+		_send_attempt_open = true;
+		_send_attempt_started_ms = now_ms;
+		return false;
+	}
+
+	const bool waited_too_long = (now_ms - _send_attempt_started_ms) > tx_mailbox_timeout_ms;
+
+	if (waited_too_long) {
+		_failInjection(InjectError::BusDead, 0);
+	}
+
+	return false;
+}
+
+bool InjectorFlasher::_sendBootCommand(BootCommand command, uint16_t index, uint32_t value)
+{
+	if (!_mailboxAvailable()) {
+		return false;
+	}
+
+	BootCommandFrame frame{};
+	frame.target_node_id = static_cast<uint8_t>(_header.target_node_id);
+	frame.command = static_cast<uint8_t>(command);
+	frame.index = index;
+	frame.value = value;
+
+	CAN_TxHeaderTypeDef header{};
+	header.StdId = boot_command_can_id;
+	header.IDE = CAN_ID_STD;
+	header.RTR = CAN_RTR_DATA;
+	header.DLC = sizeof(frame);
+
+	uint32_t mailbox = 0;
+	const bool queued = HAL_CAN_AddTxMessage(&hcan1, &header, reinterpret_cast<const uint8_t *>(&frame), &mailbox) == HAL_OK;
+
+	if (!queued) {
+		return false;
+	}
+
+	_awaiting_command = command;
+	_awaiting_index = index;
+	_reply_valid = false;
+	_command_sent_ms = HAL_GetTick();
+
+	return true;
+}
+
+bool InjectorFlasher::_sendTrigger()
+{
+	if (!_mailboxAvailable()) {
+		return false;
+	}
+
+	// The trigger is: node id, then the magic as two little-endian bytes. A bootloader ignores it.
+	const uint8_t data[3] = {static_cast<uint8_t>(_header.target_node_id),
+				 static_cast<uint8_t>(app_trigger_magic & 0xFF),
+				 static_cast<uint8_t>(app_trigger_magic >> 8)};
+
+	CAN_TxHeaderTypeDef header{};
+	header.StdId = app_trigger_can_id;
+	header.IDE = CAN_ID_STD;
+	header.RTR = CAN_RTR_DATA;
+	header.DLC = sizeof(data);
+
+	uint32_t mailbox = 0;
+
+	return HAL_CAN_AddTxMessage(&hcan1, &header, data, &mailbox) == HAL_OK;
+}
+
+void InjectorFlasher::_failInjection(InjectError error, uint8_t target_error_code)
+{
+	_command_in_flight = false;
+	_inject_error = error;
+	_target_error_code = target_error_code;
+	_inject_state = InjectState::Failed;
 }
 
 // ---- the front panel ----

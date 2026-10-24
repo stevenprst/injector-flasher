@@ -179,6 +179,49 @@ struct __attribute__((packed)) BeginImagePayload {
 
 static_assert(sizeof(BeginImagePayload) == 11, "BeginImage carries 11 bytes");
 
+// ---- CAN side: this firmware is the host of the CAN bootloader (protocol version 2) ----
+
+static constexpr uint16_t boot_command_can_id = 0x6A5;	// injector to bootloader
+static constexpr uint16_t boot_response_can_id = 0x6A6;	// bootloader to injector
+static constexpr uint16_t app_trigger_can_id = 0x6A4;	// injector to the running app: reset into the bootloader
+static constexpr uint16_t app_trigger_magic = 0xB007;
+
+enum class BootCommand : uint8_t {
+	WriteBuffer = 1,
+	WritePage = 2,
+	WriteCrc = 3,
+	Ping = 4,
+	StartApp = 6,
+};
+
+// The 8 bytes sent to the bootloader and the 8 bytes it answers with, little-endian.
+struct __attribute__((packed)) BootCommandFrame {
+	uint8_t target_node_id;
+	uint8_t command;
+	uint16_t index;
+	uint32_t value;
+};
+
+struct __attribute__((packed)) BootResponseFrame {
+	uint8_t node_id;
+	uint8_t command;
+	uint8_t code;
+	uint16_t index;
+	uint8_t payload[3];
+};
+
+static_assert(sizeof(BootCommandFrame) == 8, "a command is exactly one 8-byte CAN frame");
+static_assert(sizeof(BootResponseFrame) == 8, "a reply is exactly one 8-byte CAN frame");
+
+static constexpr uint32_t reply_timeout_ms = 1000;
+static constexpr uint32_t write_page_timeout_ms = 20000;	// a page that opens a 128 KB sector waits for the erase
+static constexpr uint32_t write_crc_timeout_ms = 5000;		// the bootloader reads the whole image
+static constexpr uint32_t start_app_timeout_ms = 5000;
+static constexpr uint32_t ping_timeout_ms = 100;
+static constexpr uint32_t ping_tries = 10;
+static constexpr uint32_t command_retries = 3;			// extra tries when a reply does not come
+static constexpr uint32_t tx_mailbox_timeout_ms = 2000;		// the bus is dead when no mailbox frees up for this long
+
 enum class InjectState : uint8_t {
 	Idle = 0,
 	Connecting = 1,		// trigger frame, then pings until the bootloader answers
@@ -188,6 +231,15 @@ enum class InjectState : uint8_t {
 	StartingApp = 5,
 	Done = 6,
 	Failed = 7,
+};
+
+enum class InjectError : uint8_t {
+	None = 0,
+	CannotConnect = 1,	// no ping was answered
+	NoReply = 2,		// a command went unanswered after its retries
+	TargetRefused = 3,	// the bootloader answered with an error code, see target_error_code
+	BusDead = 4,		// no transmit mailbox freed up
+	CanNotStarted = 5,
 };
 
 struct __attribute__((packed)) StatusPayload {
@@ -216,7 +268,7 @@ struct Button {
 class InjectorFlasher
 {
 public:
-	// Look for a stored image.
+	// Look for a stored image, set up the CAN filter and start CAN.
 	void init();
 
 	// One pass of the main loop: the PC link and the front panel.
@@ -249,6 +301,13 @@ private:
 	bool _deleteStoredImage();
 	bool _appendWord(uint32_t word);
 	bool _isInjecting() const;
+
+	// The injection into the target
+	void _readCanReplies();
+	bool _mailboxAvailable();
+	bool _sendBootCommand(BootCommand command, uint16_t index, uint32_t value);
+	bool _sendTrigger();
+	void _failInjection(InjectError error, uint8_t target_error_code);
 
 	// The front panel
 	void _servicePanel();
@@ -291,6 +350,17 @@ private:
 
 	// The injection
 	InjectState _inject_state{InjectState::Idle};
+	InjectError _inject_error{InjectError::None};
+	uint8_t _target_error_code{0};
+	bool _can_ready{false};
+	bool _command_in_flight{false};
+	uint32_t _command_sent_ms{0};
+	uint32_t _send_attempt_started_ms{0};
+	bool _send_attempt_open{false};
+	BootCommand _awaiting_command{BootCommand::Ping};
+	uint16_t _awaiting_index{0};
+	bool _reply_valid{false};
+	BootResponseFrame _boot_reply{};
 
 	// The front panel
 	Button _delete_button{};
