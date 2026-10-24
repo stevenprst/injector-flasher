@@ -55,10 +55,17 @@ void Error_Handler(void);
 /* USER CODE BEGIN EFP */
 void mainLoopInit(void);
 void mainLoopRun(void);
+void injectorUsbReceive(const uint8_t *data, uint32_t length);
 
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
+#define BUTTON_DELETE_Pin GPIO_PIN_3
+#define BUTTON_DELETE_GPIO_Port GPIOE
+#define BUTTON_INJECT_Pin GPIO_PIN_4
+#define BUTTON_INJECT_GPIO_Port GPIOE
+#define LED_STATUS_Pin GPIO_PIN_6
+#define LED_STATUS_GPIO_Port GPIOA
 
 /* USER CODE BEGIN Private defines */
 
