@@ -47,19 +47,12 @@ bool isBlank(uint32_t address, uint32_t word_count)
 	return true;
 }
 
-// Erase the sector that starts at the address. False when the address is not a sector start or the sector is not blank.
-// The CPU waits while the flash erases (up to 4 s for 128 KB), and so does the USB link.
-bool eraseSectorStartingAt(uint32_t address)
+// Run the erase of one sector. The CPU waits while the flash erases (up to 4 s for 128 KB), and so does the USB link.
+bool runSectorErase(const flash_layout::FlashSector &sector)
 {
-	const flash_layout::FlashSector *sector = flash_layout::sectorStartingAt(address);
-
-	if (sector == nullptr) {
-		return false;
-	}
-
 	FLASH_EraseInitTypeDef erase_config{};
 	erase_config.TypeErase = FLASH_TYPEERASE_SECTORS;
-	erase_config.Sector = sector->number;
+	erase_config.Sector = sector.number;
 	erase_config.NbSectors = 1;
 	erase_config.VoltageRange = FLASH_VOLTAGE_RANGE_3;
 
@@ -70,7 +63,19 @@ bool eraseSectorStartingAt(uint32_t address)
 	const HAL_StatusTypeDef erase_status = HAL_FLASHEx_Erase(&erase_config, &failed_sector_number);
 	HAL_FLASH_Lock();
 
-	if (erase_status != HAL_OK) {
+	return erase_status == HAL_OK;
+}
+
+// Erase the sector that starts at the address. False when the address is not a sector start or the sector is not blank.
+bool eraseSectorStartingAt(uint32_t address)
+{
+	const flash_layout::FlashSector *sector = flash_layout::sectorStartingAt(address);
+
+	if (sector == nullptr) {
+		return false;
+	}
+
+	if (!runSectorErase(*sector)) {
 		return false;
 	}
 
@@ -79,16 +84,17 @@ bool eraseSectorStartingAt(uint32_t address)
 	return isBlank(sector->start_address, sector->size_bytes / 4);
 }
 
-// Program words into erased flash and read them back. Words already there count as programmed.
-bool programWords(uint32_t address, const uint32_t *words, uint32_t word_count)
+// True when the flash at the address already holds exactly these words.
+bool flashHoldsWords(uint32_t address, const uint32_t *words, uint32_t word_count)
 {
 	const uint32_t *flash_words = reinterpret_cast<const uint32_t *>(address);
-	const bool already_programmed = memcmp(flash_words, words, word_count * sizeof(uint32_t)) == 0;
 
-	if (already_programmed) {
-		return true;
-	}
+	return memcmp(flash_words, words, word_count * sizeof(uint32_t)) == 0;
+}
 
+// Program the words one at a time, with the flash unlocked only for the duration.
+bool programEachWord(uint32_t address, const uint32_t *words, uint32_t word_count)
+{
 	HAL_FLASH_Unlock();
 	clearFlashErrorFlags();
 
@@ -105,9 +111,24 @@ bool programWords(uint32_t address, const uint32_t *words, uint32_t word_count)
 	}
 
 	HAL_FLASH_Lock();
+
+	return true;
+}
+
+// Program words into erased flash and read them back. Words already there count as programmed.
+bool programWords(uint32_t address, const uint32_t *words, uint32_t word_count)
+{
+	if (flashHoldsWords(address, words, word_count)) {
+		return true;
+	}
+
+	if (!programEachWord(address, words, word_count)) {
+		return false;
+	}
+
 	flushFlashCaches();
 
-	return memcmp(flash_words, words, word_count * sizeof(uint32_t)) == 0;
+	return flashHoldsWords(address, words, word_count);
 }
 
 // The hardware CRC of the words, fed one 32-bit word at a time.
@@ -116,6 +137,25 @@ uint32_t calculateWordsCrc(const uint32_t *words, uint32_t word_count)
 	__HAL_CRC_DR_RESET(&hcrc);
 
 	return HAL_CRC_Calculate(&hcrc, const_cast<uint32_t *>(words), word_count);
+}
+
+bool pageCountIsValid(uint32_t page_count)
+{
+	return page_count >= 1 && page_count <= max_page_count;
+}
+
+// The page count has to be valid, and the size in bytes has to fill the last page at least by one byte and not more
+// than the pages hold.
+bool imageDescriptionIsValid(const BeginImagePayload &image)
+{
+	if (!pageCountIsValid(image.page_count)) {
+		return false;
+	}
+
+	const uint32_t bytes_before_last_page = (image.page_count - 1u) * page_size_bytes;
+	const uint32_t bytes_in_all_pages = image.page_count * page_size_bytes;
+
+	return image.image_size_bytes > bytes_before_last_page && image.image_size_bytes <= bytes_in_all_pages;
 }
 
 bool isPressed(GPIO_TypeDef *port, uint16_t pin)
@@ -131,12 +171,10 @@ uint32_t readU32(const uint8_t *bytes)
 	return value;
 }
 
-} // namespace
-
-void InjectorFlasher::init()
+// Pass only the answers of the bootloaders: standard ID boot_response_can_id, data frame. The mask bits are the ID,
+// IDE and RTR bits. All filter banks belong to CAN1 because CAN2 is not used.
+bool configureCanFilter()
 {
-	// Pass only the answers of the bootloaders: standard ID boot_response_can_id, data frame. The mask bits are the ID,
-	// IDE and RTR bits. All filter banks belong to CAN1 because CAN2 is not used.
 	CAN_FilterTypeDef filter{};
 	filter.FilterIdHigh = boot_response_can_id << 5;
 	filter.FilterIdLow = 0x0000;
@@ -149,14 +187,52 @@ void InjectorFlasher::init()
 	filter.FilterActivation = CAN_FILTER_ENABLE;
 	filter.SlaveStartFilterBank = 14;
 
-	const bool filter_set = HAL_CAN_ConfigFilter(&hcan1, &filter) == HAL_OK;
+	return HAL_CAN_ConfigFilter(&hcan1, &filter) == HAL_OK;
+}
 
-	// The replies are read by polling in the main loop, so no CAN interrupt is enabled.
-	_can_ready = filter_set && HAL_CAN_Start(&hcan1) == HAL_OK;
+// The replies are read by polling in the main loop, so no CAN interrupt is enabled.
+bool startCan()
+{
+	if (!configureCanFilter()) {
+		return false;
+	}
+
+	return HAL_CAN_Start(&hcan1) == HAL_OK;
+}
+
+bool isBootResponse(const CAN_RxHeaderTypeDef &header)
+{
+	return header.IDE == CAN_ID_STD && header.RTR == CAN_RTR_DATA
+	       && header.StdId == boot_response_can_id && header.DLC == sizeof(BootResponseFrame);
+}
+
+// Put one standard data frame in a transmit mailbox. The caller has checked that a mailbox is free.
+bool queueCanFrame(uint16_t can_id, const uint8_t *data, uint32_t length)
+{
+	CAN_TxHeaderTypeDef header{};
+	header.StdId = can_id;
+	header.IDE = CAN_ID_STD;
+	header.RTR = CAN_RTR_DATA;
+	header.DLC = length;
+
+	uint32_t mailbox = 0;
+
+	return HAL_CAN_AddTxMessage(&hcan1, &header, data, &mailbox) == HAL_OK;
+}
+
+} // namespace
+
+void InjectorFlasher::init()
+{
+	_can_ready = startCan();
 
 	_loadHeader();
+	_readButtonsAtStart();
+}
 
-	// A button that is held while the board starts counts only after it has been released.
+// A button that is held while the board starts counts only after it has been released.
+void InjectorFlasher::_readButtonsAtStart()
+{
 	_inject_button.pressed = isPressed(BUTTON_INJECT_GPIO_Port, BUTTON_INJECT_Pin);
 	_inject_button.action_done = _inject_button.pressed;
 	_delete_button.pressed = isPressed(BUTTON_DELETE_GPIO_Port, BUTTON_DELETE_Pin);
@@ -173,18 +249,27 @@ void InjectorFlasher::run()
 void InjectorFlasher::onUsbReceive(const uint8_t *data, uint32_t length)
 {
 	for (uint32_t byte_number = 0; byte_number < length; ++byte_number) {
-		const uint32_t head = _rx_head.load(std::memory_order_relaxed);
-		const uint32_t tail = _rx_tail.load(std::memory_order_acquire);
-		const bool ring_full = (head - tail) >= usb_ring_size;
-
-		// The PC sends one request and waits, so a full ring means a broken sender and the newest bytes are dropped.
-		if (ring_full) {
+		if (!_queueUsbByte(data[byte_number])) {
 			return;
 		}
-
-		_rx_ring[head % usb_ring_size] = data[byte_number];
-		_rx_head.store(head + 1, std::memory_order_release);
 	}
+}
+
+// The PC sends one request and waits, so a full ring means a broken sender and the newest bytes are dropped.
+bool InjectorFlasher::_queueUsbByte(uint8_t byte)
+{
+	const uint32_t head = _rx_head.load(std::memory_order_relaxed);
+	const uint32_t tail = _rx_tail.load(std::memory_order_acquire);
+	const bool ring_full = (head - tail) >= usb_ring_size;
+
+	if (ring_full) {
+		return false;
+	}
+
+	_rx_ring[head % usb_ring_size] = byte;
+	_rx_head.store(head + 1, std::memory_order_release);
+
+	return true;
 }
 
 // ---- PC link ----
@@ -198,14 +283,24 @@ void InjectorFlasher::_serviceUsb()
 		return;
 	}
 
-	const uint32_t now_ms = HAL_GetTick();
-	const bool request_started = _parser_state != ParserState::WaitingForMagic;
-	const bool request_stalled = (now_ms - _last_byte_ms) > request_timeout_ms;
+	_dropStalledRequest();
+	_parsePendingBytes();
+}
 
-	if (request_started && request_stalled) {
-		_parser_state = ParserState::WaitingForMagic;
+void InjectorFlasher::_dropStalledRequest()
+{
+	const bool request_started = _parser_state != ParserState::WaitingForMagic;
+	const bool request_stalled = (HAL_GetTick() - _last_byte_ms) > request_timeout_ms;
+
+	if (!request_started || !request_stalled) {
+		return;
 	}
 
+	_parser_state = ParserState::WaitingForMagic;
+}
+
+void InjectorFlasher::_parsePendingBytes()
+{
 	while (!_reply_pending) {
 		const uint32_t tail = _rx_tail.load(std::memory_order_relaxed);
 		const uint32_t head = _rx_head.load(std::memory_order_acquire);
@@ -226,58 +321,80 @@ void InjectorFlasher::_parseByte(uint8_t byte)
 {
 	switch (_parser_state) {
 	case ParserState::WaitingForMagic:
-		if (byte == request_magic) {
-			_header_received = 0;
-			_parser_state = ParserState::ReadingHeader;
-		}
-
+		_parseMagicByte(byte);
 		break;
 
-	case ParserState::ReadingHeader: {
-			_header_bytes[_header_received] = byte;
-			_header_received++;
-
-			const bool header_complete = _header_received == sizeof(_header_bytes);
-
-			if (!header_complete) {
-				break;
-			}
-
-			_request_command = static_cast<LinkCommand>(_header_bytes[0]);
-			_request_length = _header_bytes[1] | (_header_bytes[2] << 8);
-			_payload_received = 0;
-
-			const bool payload_too_long = _request_length > max_payload_bytes;
-
-			if (payload_too_long) {
-				_parser_state = ParserState::WaitingForMagic;
-				_reply(LinkCode::BadLength, nullptr, 0);
-				break;
-			}
-
-			const bool has_payload = _request_length != 0;
-
-			if (has_payload) {
-				_parser_state = ParserState::ReadingPayload;
-				break;
-			}
-
-			_parser_state = ParserState::WaitingForMagic;
-			_handleRequest();
-			break;
-		}
+	case ParserState::ReadingHeader:
+		_parseHeaderByte(byte);
+		break;
 
 	case ParserState::ReadingPayload:
-		_request_payload[_payload_received] = byte;
-		_payload_received++;
-
-		if (_payload_received == _request_length) {
-			_parser_state = ParserState::WaitingForMagic;
-			_handleRequest();
-		}
-
+		_parsePayloadByte(byte);
 		break;
 	}
+}
+
+void InjectorFlasher::_parseMagicByte(uint8_t byte)
+{
+	if (byte != request_magic) {
+		return;
+	}
+
+	_header_received = 0;
+	_parser_state = ParserState::ReadingHeader;
+}
+
+void InjectorFlasher::_parseHeaderByte(uint8_t byte)
+{
+	_header_bytes[_header_received] = byte;
+	_header_received++;
+
+	const bool header_complete = _header_received == sizeof(_header_bytes);
+
+	if (!header_complete) {
+		return;
+	}
+
+	_finishHeader();
+}
+
+void InjectorFlasher::_finishHeader()
+{
+	_request_command = static_cast<LinkCommand>(_header_bytes[0]);
+	_request_length = _header_bytes[1] | (_header_bytes[2] << 8);
+	_payload_received = 0;
+
+	const bool payload_too_long = _request_length > max_payload_bytes;
+
+	if (payload_too_long) {
+		_parser_state = ParserState::WaitingForMagic;
+		return _reply(LinkCode::BadLength, nullptr, 0);
+	}
+
+	const bool has_payload = _request_length != 0;
+
+	if (has_payload) {
+		_parser_state = ParserState::ReadingPayload;
+		return;
+	}
+
+	_parser_state = ParserState::WaitingForMagic;
+	_handleRequest();
+}
+
+void InjectorFlasher::_parsePayloadByte(uint8_t byte)
+{
+	_request_payload[_payload_received] = byte;
+	_payload_received++;
+
+	const bool payload_complete = _payload_received == _request_length;
+
+	if (!payload_complete) {
+		return;
+	}
+
+	_parser_state = ParserState::WaitingForMagic;
+	_handleRequest();
 }
 
 void InjectorFlasher::_handleRequest()
@@ -330,91 +447,56 @@ void InjectorFlasher::_handleGetStatus()
 void InjectorFlasher::_handleBeginImage()
 {
 	if (_isInjecting()) {
-		_reply(LinkCode::Busy, nullptr, 0);
-		return;
+		return _reply(LinkCode::Busy, nullptr, 0);
 	}
 
 	if (_request_length != sizeof(BeginImagePayload)) {
-		_reply(LinkCode::BadLength, nullptr, 0);
-		return;
+		return _reply(LinkCode::BadLength, nullptr, 0);
 	}
 
 	BeginImagePayload incoming;
 	memcpy(&incoming, _request_payload, sizeof(incoming));
 
-	const bool page_count_valid = incoming.page_count >= 1 && incoming.page_count <= max_page_count;
-
-	// The size in bytes has to fill the last page at least by one byte and not more than the pages hold.
-	const uint32_t bytes_before_last_page = (incoming.page_count - 1u) * page_size_bytes;
-	const uint32_t bytes_in_all_pages = incoming.page_count * page_size_bytes;
-	const bool size_fits_pages = incoming.image_size_bytes > bytes_before_last_page
-				     && incoming.image_size_bytes <= bytes_in_all_pages;
-
-	if (!page_count_valid || !size_fits_pages) {
-		_reply(LinkCode::BadImage, nullptr, 0);
-		return;
+	if (!imageDescriptionIsValid(incoming)) {
+		return _reply(LinkCode::BadImage, nullptr, 0);
 	}
 
 	// The stored image is given up here: without a header there is no image, whatever happens next.
-	_has_image = false;
-	_inject_state = InjectState::Idle;
-	_inject_error = InjectError::None;
-	_target_error_code = 0;
-	_inject_page = 0;
+	_forgetStoredImage();
 
 	if (!eraseSectorStartingAt(header_sector_address)) {
 		_receiving = false;
-		_reply(LinkCode::FlashFailed, nullptr, 0);
-		return;
+		return _reply(LinkCode::FlashFailed, nullptr, 0);
 	}
 
-	_incoming = incoming;
-	_receiving = true;
-	_expected_offset = 0;
-	_words_in_page = 0;
-	_pages_written = 0;
+	_startReceiving(incoming);
 	_reply(LinkCode::Ok, nullptr, 0);
 }
 
 void InjectorFlasher::_handleWriteChunk()
 {
 	if (!_receiving) {
-		_reply(LinkCode::BadState, nullptr, 0);
-		return;
+		return _reply(LinkCode::BadState, nullptr, 0);
 	}
 
-	const bool carries_words = _request_length > chunk_offset_bytes
-				   && (_request_length - chunk_offset_bytes) % sizeof(uint32_t) == 0;
-
-	if (!carries_words) {
-		_reply(LinkCode::BadLength, nullptr, 0);
-		return;
+	if (!_chunkCarriesWords()) {
+		return _reply(LinkCode::BadLength, nullptr, 0);
 	}
 
 	const uint32_t offset = readU32(_request_payload);
 	const uint32_t data_bytes = _request_length - chunk_offset_bytes;
 
 	if (offset != _expected_offset) {
-		_reply(LinkCode::BadOffset, nullptr, 0);
-		return;
+		return _reply(LinkCode::BadOffset, nullptr, 0);
 	}
 
-	const uint32_t image_bytes = _incoming.page_count * page_size_bytes;
-	const bool fits_in_image = offset + data_bytes <= image_bytes;
-
-	if (!fits_in_image) {
-		_reply(LinkCode::BadLength, nullptr, 0);
-		return;
+	if (!_chunkFitsInImage(offset, data_bytes)) {
+		return _reply(LinkCode::BadLength, nullptr, 0);
 	}
 
-	for (uint32_t byte_number = 0; byte_number < data_bytes; byte_number += sizeof(uint32_t)) {
-		const uint32_t word = readU32(&_request_payload[chunk_offset_bytes + byte_number]);
-
-		if (!_appendWord(word)) {
-			_receiving = false;
-			_reply(LinkCode::FlashFailed, nullptr, 0);
-			return;
-		}
+	if (!_appendChunkWords(data_bytes)) {
+		_receiving = false;
+		return _reply(LinkCode::FlashFailed, nullptr, 0);
 	}
 
 	_expected_offset += data_bytes;
@@ -424,44 +506,23 @@ void InjectorFlasher::_handleWriteChunk()
 void InjectorFlasher::_handleEndImage()
 {
 	if (!_receiving) {
-		_reply(LinkCode::BadState, nullptr, 0);
-		return;
+		return _reply(LinkCode::BadState, nullptr, 0);
 	}
 
-	const uint32_t image_bytes = _incoming.page_count * page_size_bytes;
-	const bool image_complete = _expected_offset == image_bytes;
-
-	if (!image_complete) {
-		_reply(LinkCode::BadState, nullptr, 0);
-		return;
+	if (!_incomingImageIsComplete()) {
+		return _reply(LinkCode::BadState, nullptr, 0);
 	}
 
 	_receiving = false;
 
-	const uint32_t stored_crc = calculateWordsCrc(imageWords(), _incoming.page_count * page_size_words);
-	const bool crc_matches = stored_crc == _incoming.image_crc;
-
-	if (!crc_matches) {
-		_reply(LinkCode::CrcMismatch, nullptr, 0);
-		return;
+	if (!_incomingImageCrcMatches()) {
+		return _reply(LinkCode::CrcMismatch, nullptr, 0);
 	}
 
-	ImageHeader header{};
-	header.magic = header_magic;
-	header.image_size_bytes = _incoming.image_size_bytes;
-	header.image_crc = _incoming.image_crc;
-	header.page_count = _incoming.page_count;
-	header.target_node_id = _incoming.target_node_id;
-
-	const bool header_stored = programWords(header_sector_address, reinterpret_cast<const uint32_t *>(&header),
-					 sizeof(header) / sizeof(uint32_t));
-
-	if (!header_stored) {
-		_reply(LinkCode::FlashFailed, nullptr, 0);
-		return;
+	if (!_storeHeader()) {
+		return _reply(LinkCode::FlashFailed, nullptr, 0);
 	}
 
-	_header = header;
 	_has_image = true;
 	_reply(LinkCode::Ok, nullptr, 0);
 }
@@ -469,13 +530,11 @@ void InjectorFlasher::_handleEndImage()
 void InjectorFlasher::_handleDeleteImage()
 {
 	if (_isInjecting()) {
-		_reply(LinkCode::Busy, nullptr, 0);
-		return;
+		return _reply(LinkCode::Busy, nullptr, 0);
 	}
 
 	if (!_deleteStoredImage()) {
-		_reply(LinkCode::FlashFailed, nullptr, 0);
-		return;
+		return _reply(LinkCode::FlashFailed, nullptr, 0);
 	}
 
 	_reply(LinkCode::Ok, nullptr, 0);
@@ -517,9 +576,8 @@ void InjectorFlasher::_loadHeader()
 	const ImageHeader *stored = reinterpret_cast<const ImageHeader *>(header_sector_address);
 
 	const bool magic_present = stored->magic == header_magic;
-	const bool page_count_valid = stored->page_count >= 1 && stored->page_count <= max_page_count;
 
-	if (!magic_present || !page_count_valid) {
+	if (!magic_present || !pageCountIsValid(stored->page_count)) {
 		_has_image = false;
 		return;
 	}
@@ -537,16 +595,57 @@ void InjectorFlasher::_loadHeader()
 	_has_image = true;
 }
 
-bool InjectorFlasher::_deleteStoredImage()
+// Without a stored image the injection state is blank too.
+void InjectorFlasher::_forgetStoredImage()
 {
 	_has_image = false;
-	_receiving = false;
 	_inject_state = InjectState::Idle;
 	_inject_error = InjectError::None;
 	_target_error_code = 0;
 	_inject_page = 0;
+}
+
+bool InjectorFlasher::_deleteStoredImage()
+{
+	_forgetStoredImage();
+	_receiving = false;
 
 	return eraseSectorStartingAt(header_sector_address);
+}
+
+void InjectorFlasher::_startReceiving(const BeginImagePayload &incoming)
+{
+	_incoming = incoming;
+	_receiving = true;
+	_expected_offset = 0;
+	_words_in_page = 0;
+	_pages_written = 0;
+}
+
+// A chunk is its offset and then whole flash words, at least one.
+bool InjectorFlasher::_chunkCarriesWords() const
+{
+	return _request_length > chunk_offset_bytes && (_request_length - chunk_offset_bytes) % sizeof(uint32_t) == 0;
+}
+
+bool InjectorFlasher::_chunkFitsInImage(uint32_t offset, uint32_t data_bytes) const
+{
+	const uint32_t image_bytes = _incoming.page_count * page_size_bytes;
+
+	return offset + data_bytes <= image_bytes;
+}
+
+bool InjectorFlasher::_appendChunkWords(uint32_t data_bytes)
+{
+	for (uint32_t byte_number = 0; byte_number < data_bytes; byte_number += sizeof(uint32_t)) {
+		const uint32_t word = readU32(&_request_payload[chunk_offset_bytes + byte_number]);
+
+		if (!_appendWord(word)) {
+			return false;
+		}
+	}
+
+	return true;
 }
 
 bool InjectorFlasher::_appendWord(uint32_t word)
@@ -560,7 +659,12 @@ bool InjectorFlasher::_appendWord(uint32_t word)
 		return true;
 	}
 
-	// Pages arrive in order, so a sector is erased when the page that opens it arrives.
+	return _commitPage();
+}
+
+// Pages arrive in order, so a sector is erased when the page that opens it arrives.
+bool InjectorFlasher::_commitPage()
+{
 	const uint32_t page_address = image_address + _pages_written * page_size_bytes;
 	const bool starts_sector = flash_layout::isSectorStart(page_address);
 
@@ -574,6 +678,42 @@ bool InjectorFlasher::_appendWord(uint32_t word)
 
 	_pages_written++;
 	_words_in_page = 0;
+
+	return true;
+}
+
+bool InjectorFlasher::_incomingImageIsComplete() const
+{
+	const uint32_t image_bytes = _incoming.page_count * page_size_bytes;
+
+	return _expected_offset == image_bytes;
+}
+
+bool InjectorFlasher::_incomingImageCrcMatches() const
+{
+	const uint32_t stored_crc = calculateWordsCrc(imageWords(), _incoming.page_count * page_size_words);
+
+	return stored_crc == _incoming.image_crc;
+}
+
+// The header is written last, so a transfer that stops halfway leaves no valid image.
+bool InjectorFlasher::_storeHeader()
+{
+	ImageHeader header{};
+	header.magic = header_magic;
+	header.image_size_bytes = _incoming.image_size_bytes;
+	header.image_crc = _incoming.image_crc;
+	header.page_count = _incoming.page_count;
+	header.target_node_id = _incoming.target_node_id;
+
+	const bool header_stored = programWords(header_sector_address, reinterpret_cast<const uint32_t *>(&header),
+					 sizeof(header) / sizeof(uint32_t));
+
+	if (!header_stored) {
+		return false;
+	}
+
+	_header = header;
 
 	return true;
 }
@@ -607,6 +747,17 @@ void InjectorFlasher::_startInjection()
 		return;
 	}
 
+	_resetInjectionProgress();
+
+	if (!_can_ready) {
+		return _failInjection(InjectError::CanNotStarted, 0);
+	}
+
+	_inject_state = InjectState::Connecting;
+}
+
+void InjectorFlasher::_resetInjectionProgress()
+{
 	_inject_error = InjectError::None;
 	_target_error_code = 0;
 	_inject_page = 0;
@@ -615,13 +766,6 @@ void InjectorFlasher::_startInjection()
 	_ping_count = 0;
 	_command_in_flight = false;
 	_send_attempt_open = false;
-
-	if (!_can_ready) {
-		_failInjection(InjectError::CanNotStarted, 0);
-		return;
-	}
-
-	_inject_state = InjectState::Connecting;
 }
 
 void InjectorFlasher::_serviceInjection()
@@ -634,75 +778,94 @@ void InjectorFlasher::_serviceInjection()
 		_stepConnecting();
 		break;
 
-	case InjectState::SendingWords: {
-			const uint32_t word = imageWords()[_inject_page * page_size_words + _inject_word];
-			const Progress progress = _runCommand(BootCommand::WriteBuffer, static_cast<uint16_t>(_inject_word), word,
-							      reply_timeout_ms);
+	case InjectState::SendingWords:
+		_stepSendingWords();
+		break;
 
-			if (progress != Progress::Succeeded) {
-				break;
-			}
+	case InjectState::WritingPage:
+		_stepWritingPage();
+		break;
 
-			_inject_word++;
+	case InjectState::WritingCrc:
+		_stepWritingCrc();
+		break;
 
-			const bool page_complete = _inject_word == page_size_words;
-
-			if (page_complete) {
-				_page_crc = calculateWordsCrc(&imageWords()[_inject_page * page_size_words], page_size_words);
-				_inject_word = 0;
-				_inject_state = InjectState::WritingPage;
-			}
-
-			break;
-		}
-
-	case InjectState::WritingPage: {
-			const Progress progress = _runCommand(BootCommand::WritePage, static_cast<uint16_t>(_inject_page), _page_crc,
-							      write_page_timeout_ms);
-
-			if (progress != Progress::Succeeded) {
-				break;
-			}
-
-			_inject_page++;
-
-			const bool last_page_done = _inject_page == _header.page_count;
-
-			if (last_page_done) {
-				_inject_state = InjectState::WritingCrc;
-			} else {
-				_inject_state = InjectState::SendingWords;
-			}
-
-			break;
-		}
-
-	case InjectState::WritingCrc: {
-			const Progress progress = _runCommand(BootCommand::WriteCrc, static_cast<uint16_t>(_header.page_count),
-							      _header.image_crc, write_crc_timeout_ms);
-
-			if (progress == Progress::Succeeded) {
-				_inject_state = InjectState::StartingApp;
-			}
-
-			break;
-		}
-
-	case InjectState::StartingApp: {
-			const Progress progress = _runCommand(BootCommand::StartApp, 0, 0, start_app_timeout_ms);
-
-			if (progress == Progress::Succeeded) {
-				_inject_state = InjectState::Done;
-			}
-
-			break;
-		}
+	case InjectState::StartingApp:
+		_stepStartingApp();
+		break;
 
 	case InjectState::Idle:
 	case InjectState::Done:
 	case InjectState::Failed:
 		break;
 	}
+}
+
+void InjectorFlasher::_stepSendingWords()
+{
+	const uint32_t word = imageWords()[_inject_page * page_size_words + _inject_word];
+	const Progress progress = _runCommand(BootCommand::WriteBuffer, static_cast<uint16_t>(_inject_word), word,
+					      reply_timeout_ms);
+
+	if (progress != Progress::Succeeded) {
+		return;
+	}
+
+	_inject_word++;
+
+	const bool page_complete = _inject_word == page_size_words;
+
+	if (!page_complete) {
+		return;
+	}
+
+	_page_crc = calculateWordsCrc(&imageWords()[_inject_page * page_size_words], page_size_words);
+	_inject_word = 0;
+	_inject_state = InjectState::WritingPage;
+}
+
+void InjectorFlasher::_stepWritingPage()
+{
+	const Progress progress = _runCommand(BootCommand::WritePage, static_cast<uint16_t>(_inject_page), _page_crc,
+					      write_page_timeout_ms);
+
+	if (progress != Progress::Succeeded) {
+		return;
+	}
+
+	_inject_page++;
+
+	const bool last_page_done = _inject_page == _header.page_count;
+
+	if (last_page_done) {
+		_inject_state = InjectState::WritingCrc;
+		return;
+	}
+
+	_inject_state = InjectState::SendingWords;
+}
+
+void InjectorFlasher::_stepWritingCrc()
+{
+	const Progress progress = _runCommand(BootCommand::WriteCrc, static_cast<uint16_t>(_header.page_count),
+					      _header.image_crc, write_crc_timeout_ms);
+
+	if (progress != Progress::Succeeded) {
+		return;
+	}
+
+	_inject_state = InjectState::StartingApp;
+}
+
+void InjectorFlasher::_stepStartingApp()
+{
+	const Progress progress = _runCommand(BootCommand::StartApp, 0, 0, start_app_timeout_ms);
+
+	if (progress != Progress::Succeeded) {
+		return;
+	}
+
+	_inject_state = InjectState::Done;
 }
 
 void InjectorFlasher::_readCanReplies()
@@ -715,25 +878,30 @@ void InjectorFlasher::_readCanReplies()
 			return;
 		}
 
-		const bool is_reply = header.IDE == CAN_ID_STD && header.RTR == CAN_RTR_DATA
-				      && header.StdId == boot_response_can_id && header.DLC == sizeof(BootResponseFrame);
-
-		if (!is_reply) {
+		if (!isBootResponse(header)) {
 			continue;
 		}
 
 		BootResponseFrame response;
 		memcpy(&response, data, sizeof(response));
 
-		const bool from_target = response.node_id == _header.target_node_id;
-		const bool answers_command = response.command == static_cast<uint8_t>(_awaiting_command)
-					     && response.index == _awaiting_index;
-
-		if (_command_in_flight && from_target && answers_command) {
-			_boot_reply = response;
-			_reply_valid = true;
-		}
+		_acceptReply(response);
 	}
+}
+
+// Keep the reply only when it answers the command that is waiting, from the board that was asked.
+void InjectorFlasher::_acceptReply(const BootResponseFrame &response)
+{
+	const bool from_target = response.node_id == _header.target_node_id;
+	const bool answers_command = response.command == static_cast<uint8_t>(_awaiting_command)
+				     && response.index == _awaiting_index;
+
+	if (!_command_in_flight || !from_target || !answers_command) {
+		return;
+	}
+
+	_boot_reply = response;
+	_reply_valid = true;
 }
 
 bool InjectorFlasher::_mailboxAvailable()
@@ -773,16 +941,7 @@ bool InjectorFlasher::_sendBootCommand(BootCommand command, uint16_t index, uint
 	frame.index = index;
 	frame.value = value;
 
-	CAN_TxHeaderTypeDef header{};
-	header.StdId = boot_command_can_id;
-	header.IDE = CAN_ID_STD;
-	header.RTR = CAN_RTR_DATA;
-	header.DLC = sizeof(frame);
-
-	uint32_t mailbox = 0;
-	const bool queued = HAL_CAN_AddTxMessage(&hcan1, &header, reinterpret_cast<const uint8_t *>(&frame), &mailbox) == HAL_OK;
-
-	if (!queued) {
+	if (!queueCanFrame(boot_command_can_id, reinterpret_cast<const uint8_t *>(&frame), sizeof(frame))) {
 		return false;
 	}
 
@@ -805,15 +964,7 @@ bool InjectorFlasher::_sendTrigger()
 				 static_cast<uint8_t>(app_trigger_magic & 0xFF),
 				 static_cast<uint8_t>(app_trigger_magic >> 8)};
 
-	CAN_TxHeaderTypeDef header{};
-	header.StdId = app_trigger_can_id;
-	header.IDE = CAN_ID_STD;
-	header.RTR = CAN_RTR_DATA;
-	header.DLC = sizeof(data);
-
-	uint32_t mailbox = 0;
-
-	return HAL_CAN_AddTxMessage(&hcan1, &header, data, &mailbox) == HAL_OK;
+	return queueCanFrame(app_trigger_can_id, data, sizeof(data));
 }
 
 void InjectorFlasher::_failInjection(InjectError error, uint8_t target_error_code)
@@ -828,30 +979,15 @@ InjectorFlasher::Progress InjectorFlasher::_runCommand(BootCommand command, uint
 		uint32_t timeout_ms)
 {
 	if (!_command_in_flight) {
-		if (_sendBootCommand(command, index, value)) {
-			_command_in_flight = true;
-			_retries = 0;
-		}
-
+		_startCommand(command, index, value);
 		return Progress::InProgress;
 	}
 
 	if (_reply_valid) {
-		_command_in_flight = false;
-
-		const bool accepted = _boot_reply.code == 0;
-
-		if (accepted) {
-			return Progress::Succeeded;
-		}
-
-		_failInjection(InjectError::TargetRefused, _boot_reply.code);
-		return Progress::Failed;
+		return _finishCommand();
 	}
 
-	const bool timed_out = (HAL_GetTick() - _command_sent_ms) >= timeout_ms;
-
-	if (!timed_out) {
+	if (!_commandTimedOut(timeout_ms)) {
 		return Progress::InProgress;
 	}
 
@@ -868,6 +1004,36 @@ InjectorFlasher::Progress InjectorFlasher::_runCommand(BootCommand command, uint
 	return Progress::InProgress;
 }
 
+void InjectorFlasher::_startCommand(BootCommand command, uint16_t index, uint32_t value)
+{
+	if (!_sendBootCommand(command, index, value)) {
+		return;
+	}
+
+	_command_in_flight = true;
+	_retries = 0;
+}
+
+InjectorFlasher::Progress InjectorFlasher::_finishCommand()
+{
+	_command_in_flight = false;
+
+	const bool accepted = _boot_reply.code == 0;
+
+	if (accepted) {
+		return Progress::Succeeded;
+	}
+
+	_failInjection(InjectError::TargetRefused, _boot_reply.code);
+
+	return Progress::Failed;
+}
+
+bool InjectorFlasher::_commandTimedOut(uint32_t timeout_ms) const
+{
+	return (HAL_GetTick() - _command_sent_ms) >= timeout_ms;
+}
+
 void InjectorFlasher::_stepConnecting()
 {
 	// First the trigger, which resets a running app into its bootloader.
@@ -877,32 +1043,41 @@ void InjectorFlasher::_stepConnecting()
 	}
 
 	if (!_command_in_flight) {
-		if (_ping_count >= ping_tries) {
-			_failInjection(InjectError::CannotConnect, 0);
-			return;
-		}
-
-		if (_sendBootCommand(BootCommand::Ping, 0, 0)) {
-			_command_in_flight = true;
-			_ping_count++;
-		}
-
-		return;
+		return _sendPing();
 	}
 
 	if (_reply_valid) {
-		_command_in_flight = false;
-		_inject_page = 0;
-		_inject_word = 0;
-		_inject_state = InjectState::SendingWords;
+		return _startSendingWords();
+	}
+
+	if (!_commandTimedOut(ping_timeout_ms)) {
 		return;
 	}
 
-	const bool ping_timed_out = (HAL_GetTick() - _command_sent_ms) >= ping_timeout_ms;
+	_command_in_flight = false;
+}
 
-	if (ping_timed_out) {
-		_command_in_flight = false;
+void InjectorFlasher::_sendPing()
+{
+	if (_ping_count >= ping_tries) {
+		return _failInjection(InjectError::CannotConnect, 0);
 	}
+
+	if (!_sendBootCommand(BootCommand::Ping, 0, 0)) {
+		return;
+	}
+
+	_command_in_flight = true;
+	_ping_count++;
+}
+
+// The bootloader answered a ping, so the first word of the first page goes next.
+void InjectorFlasher::_startSendingWords()
+{
+	_command_in_flight = false;
+	_inject_page = 0;
+	_inject_word = 0;
+	_inject_state = InjectState::SendingWords;
 }
 
 // ---- the front panel ----
@@ -914,27 +1089,41 @@ void InjectorFlasher::_servicePanel()
 	_updateButton(_inject_button, BUTTON_INJECT_GPIO_Port, BUTTON_INJECT_Pin, now_ms);
 	_updateButton(_delete_button, BUTTON_DELETE_GPIO_Port, BUTTON_DELETE_Pin, now_ms);
 
-	const bool inject_pressed_long_enough = _inject_button.pressed && !_inject_button.action_done
-						&& (now_ms - _inject_button.pressed_since_ms) >= button_debounce_ms;
-
-	if (inject_pressed_long_enough) {
-		_inject_button.action_done = true;
-		_startInjection();
-	}
-
-	const bool delete_held_long_enough = _delete_button.pressed && !_delete_button.action_done
-					     && (now_ms - _delete_button.pressed_since_ms) >= delete_hold_ms;
-
-	if (delete_held_long_enough) {
-		_delete_button.action_done = true;
-
-		// The stored image is neither deleted under an injection nor under a transfer from the PC.
-		if (!_isInjecting() && !_receiving) {
-			_deleteStoredImage();
-		}
-	}
-
+	_runInjectButton(now_ms);
+	_runDeleteButton(now_ms);
 	_updateLed(now_ms);
+}
+
+void InjectorFlasher::_runInjectButton(uint32_t now_ms)
+{
+	const bool pressed_long_enough = _inject_button.pressed && !_inject_button.action_done
+					 && (now_ms - _inject_button.pressed_since_ms) >= button_debounce_ms;
+
+	if (!pressed_long_enough) {
+		return;
+	}
+
+	_inject_button.action_done = true;
+	_startInjection();
+}
+
+void InjectorFlasher::_runDeleteButton(uint32_t now_ms)
+{
+	const bool held_long_enough = _delete_button.pressed && !_delete_button.action_done
+				      && (now_ms - _delete_button.pressed_since_ms) >= delete_hold_ms;
+
+	if (!held_long_enough) {
+		return;
+	}
+
+	_delete_button.action_done = true;
+
+	// The stored image is neither deleted under an injection nor under a transfer from the PC.
+	if (_isInjecting() || _receiving) {
+		return;
+	}
+
+	_deleteStoredImage();
 }
 
 void InjectorFlasher::_updateButton(Button &button, GPIO_TypeDef *port, uint16_t pin, uint32_t now_ms)

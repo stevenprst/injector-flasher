@@ -284,9 +284,19 @@ private:
 		ReadingPayload,
 	};
 
+	// init(): the buttons as they read at start-up
+	void _readButtonsAtStart();
+
 	// PC link
+	bool _queueUsbByte(uint8_t byte);
 	void _serviceUsb();
+	void _dropStalledRequest();
+	void _parsePendingBytes();
 	void _parseByte(uint8_t byte);
+	void _parseMagicByte(uint8_t byte);
+	void _parseHeaderByte(uint8_t byte);
+	void _finishHeader();
+	void _parsePayloadByte(uint8_t byte);
 	void _handleRequest();
 	void _handleGetStatus();
 	void _handleBeginImage();
@@ -298,24 +308,46 @@ private:
 
 	// The stored image
 	void _loadHeader();
+	void _forgetStoredImage();
 	bool _deleteStoredImage();
+	void _startReceiving(const BeginImagePayload &incoming);
+	bool _chunkCarriesWords() const;
+	bool _chunkFitsInImage(uint32_t offset, uint32_t data_bytes) const;
+	bool _appendChunkWords(uint32_t data_bytes);
 	bool _appendWord(uint32_t word);
+	bool _commitPage();
+	bool _incomingImageIsComplete() const;
+	bool _incomingImageCrcMatches() const;
+	bool _storeHeader();
 	bool _isInjecting() const;
 
 	// The injection into the target
 	void _startInjection();
+	void _resetInjectionProgress();
 	void _serviceInjection();
+	void _stepSendingWords();
+	void _stepWritingPage();
+	void _stepWritingCrc();
+	void _stepStartingApp();
 	void _readCanReplies();
+	void _acceptReply(const BootResponseFrame &response);
 	bool _mailboxAvailable();
 	bool _sendBootCommand(BootCommand command, uint16_t index, uint32_t value);
 	bool _sendTrigger();
 	void _failInjection(InjectError error, uint8_t target_error_code);
 	enum class Progress : uint8_t { InProgress, Succeeded, Failed };
 	Progress _runCommand(BootCommand command, uint16_t index, uint32_t value, uint32_t timeout_ms);
+	void _startCommand(BootCommand command, uint16_t index, uint32_t value);
+	Progress _finishCommand();
+	bool _commandTimedOut(uint32_t timeout_ms) const;
 	void _stepConnecting();
+	void _sendPing();
+	void _startSendingWords();
 
 	// The front panel
 	void _servicePanel();
+	void _runInjectButton(uint32_t now_ms);
+	void _runDeleteButton(uint32_t now_ms);
 	void _updateButton(Button &button, GPIO_TypeDef *port, uint16_t pin, uint32_t now_ms);
 	void _updateLed(uint32_t now_ms);
 
